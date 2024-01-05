@@ -2,7 +2,9 @@ import path = require('path');
 
 import { expect, assert } from 'chai';
 import { P256 } from '@noble/curves/p256';
+import base32 from 'hi-base32';
 import { SignatureType } from '@noble/curves/abstract/weierstrass';
+import rs from 'jsrsasign';
 const circom_tester = require('circom_tester');
 const wasm_tester = circom_tester.wasm;
 
@@ -12,6 +14,24 @@ exports.p = Scalar.fromString(
   '21888242871839275222246405745257275088548364400416034343698204186575808495617'
 );
 const Fr = new F1Field(exports.p);
+
+function extractRandSFromUint8ArraySignature(uint8ArraySig: Uint8Array) {
+  const halfLength = uint8ArraySig.length / 2;
+  const rBytes = uint8ArraySig.slice(0, halfLength);
+  const sBytes = uint8ArraySig.slice(halfLength);
+
+  const rHex = Array.from(rBytes)
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
+  const sHex = Array.from(sBytes)
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
+
+  const rBigInt = BigInt('0x' + rHex);
+  const sBigInt = BigInt('0x' + sHex);
+
+  return { r: rBigInt, s: sBigInt };
+}
 
 function bigint_to_tuple(x: bigint) {
   let mod: bigint = 2n ** 43n;
@@ -239,4 +259,51 @@ describe('ECDSAVerifyNoPubkeyCheck', function () {
   };
 
   test_cases.forEach(test_ecdsa_verify);
+});
+
+describe('ECDSAVerifyNoPubkeyCheckWithFrenchID', function () {
+  this.timeout(1000 ** 10);
+
+  const sampleInput =
+    'DC03FR000001092D1636070160NATACHA62SPECIMEN65P 6607CD1230467FR68F6CFREYLJXYH5R3HYO5YWTMELK7P277KKOK5TTNB26S6UAPDH2KJGT37YXNDEZTGEK2LX3OSRNAXOP4UHFWHNTOU6LTOSBMX2EBCQ36UZ4FA';
+  const publicKeyPem =
+    '-----BEGIN PUBLIC KEY-----MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEqY8NfM1igIiTvsTUNuedGDSh1uAB1w8cTNzNnZ4v4in3JAUU6N3AypjQx0QMnMSShJoPvac/w5L02grgf4TCPA==-----END PUBLIC KEY-----';
+
+  const [message, signature] = sampleInput.split('\u001f');
+
+  const publicKey = rs.KEYUTIL.getKey(publicKeyPem);
+  const { x: pubx, y: puby } = (publicKey as rs.KJUR.crypto.ECDSA).getPublicKeyXYHex();
+  const pub0 = BigInt('0x' + pubx);
+  const pub1 = BigInt('0x' + puby);
+
+  const messageHash = rs.KJUR.crypto.Util.sha256(message);
+  const messageHashBigint = BigInt('0x' + messageHash);
+
+  const { r, s } = extractRandSFromUint8ArraySignature(
+    new Uint8Array(base32.decode.asBytes(signature))
+  );
+
+  let circuit: any;
+  before(async function () {
+    circuit = await wasm_tester(path.join(__dirname, 'circuits_p256', 'test_ecdsa_verify.circom'));
+  });
+
+  it.only('Verify ECDSA sig of a French ID', async function () {
+    // in compact format: r (big-endian), 32-bytes + s (big-endian), 32-bytes
+    var r_array: bigint[] = bigint_to_array(43, 6, r);
+    var s_array: bigint[] = bigint_to_array(43, 6, s);
+    var msghash_array: bigint[] = bigint_to_array(43, 6, messageHashBigint);
+    var pub0_array: bigint[] = bigint_to_array(43, 6, pub0);
+    var pub1_array: bigint[] = bigint_to_array(43, 6, pub1);
+    var res = 1n;
+
+    let witness = await circuit.calculateWitness({
+      r: r_array,
+      s: s_array,
+      msghash: msghash_array,
+      pubkey: [pub0_array, pub1_array],
+    });
+    expect(witness[1]).to.equal(res);
+    await circuit.checkConstraints(witness);
+  });
 });
